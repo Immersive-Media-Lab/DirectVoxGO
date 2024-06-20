@@ -2,9 +2,9 @@ import os, sys, copy, glob, json, time, random, argparse
 from shutil import copyfile
 from tqdm import tqdm, trange
 
-import mmcv
 import imageio
 import numpy as np
+import mmengine
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,15 @@ from lib.load_data import load_data
 
 from torch_efficient_distloss import flatten_eff_distloss
 
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask_socketio import SocketIO
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+time_array = []
+current_image_index = 0
+theta = np.pi
+theta_x, theta_y, theta_z = 0, 0, 0
 
 def config_parser():
     '''Define command line arguments
@@ -35,12 +44,14 @@ def config_parser():
                         help='export scene bbox and camera poses for debugging and 3d visualization')
     parser.add_argument("--export_coarse_only", type=str, default='')
 
+    parser.add_argument("--render_free", action='store_true')
     # testing options
     parser.add_argument("--render_only", action='store_true',
                         help='do not optimize, reload weights and render out render_poses path')
     parser.add_argument("--render_test", action='store_true')
     parser.add_argument("--render_train", action='store_true')
     parser.add_argument("--render_video", action='store_true')
+    parser.add_argument("--viewer", action='store_true')
     parser.add_argument("--render_video_flipy", action='store_true')
     parser.add_argument("--render_video_rot90", default=0, type=int)
     parser.add_argument("--render_video_factor", type=float, default=0,
@@ -82,20 +93,21 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
     lpips_vgg = []
 
     for i, c2w in enumerate(tqdm(render_poses)):
-
+        start = time.time()
         H, W = HW[i]
         K = Ks[i]
         c2w = torch.Tensor(c2w)
-        rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+        rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view( #중요
                 H, W, K, c2w, ndc, inverse_y=render_kwargs['inverse_y'],
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         keys = ['rgb_marched', 'depth', 'alphainv_last']
         rays_o = rays_o.flatten(0,-2)
         rays_d = rays_d.flatten(0,-2)
         viewdirs = viewdirs.flatten(0,-2)
+        b_size = 8192
         render_result_chunks = [
             {k: v for k, v in model(ro, rd, vd, **render_kwargs).items() if k in keys}
-            for ro, rd, vd in zip(rays_o.split(8192, 0), rays_d.split(8192, 0), viewdirs.split(8192, 0))
+            for ro, rd, vd in zip(rays_o.split(b_size, 0), rays_d.split(b_size, 0), viewdirs.split(b_size, 0))
         ]
         render_result = {
             k: torch.cat([ret[k] for ret in render_result_chunks]).reshape(H,W,-1)
@@ -108,6 +120,8 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
         rgbs.append(rgb)
         depths.append(depth)
         bgmaps.append(bgmap)
+        end = time.time()
+        print('Rendering', i, 'time', end-start, 'secs')
         if i==0:
             print('Testing', rgb.shape)
 
@@ -120,6 +134,101 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
                 lpips_alex.append(utils.rgb_lpips(rgb, gt_imgs[i], net_name='alex', device=c2w.device))
             if eval_lpips_vgg:
                 lpips_vgg.append(utils.rgb_lpips(rgb, gt_imgs[i], net_name='vgg', device=c2w.device))
+
+    if len(psnrs):
+        print('Testing psnr', np.mean(psnrs), '(avg)')
+        if eval_ssim: print('Testing ssim', np.mean(ssims), '(avg)')
+        if eval_lpips_vgg: print('Testing lpips (vgg)', np.mean(lpips_vgg), '(avg)')
+        if eval_lpips_alex: print('Testing lpips (alex)', np.mean(lpips_alex), '(avg)')
+
+    if render_video_flipy:
+        for i in range(len(rgbs)):
+            rgbs[i] = np.flip(rgbs[i], axis=0)
+            depths[i] = np.flip(depths[i], axis=0)
+            bgmaps[i] = np.flip(bgmaps[i], axis=0)
+
+    if render_video_rot90 != 0:
+        for i in range(len(rgbs)):
+            rgbs[i] = np.rot90(rgbs[i], k=render_video_rot90, axes=(0,1))
+            depths[i] = np.rot90(depths[i], k=render_video_rot90, axes=(0,1))
+            bgmaps[i] = np.rot90(bgmaps[i], k=render_video_rot90, axes=(0,1))
+
+    if savedir is not None and dump_images:
+        for i in trange(len(rgbs)):
+            rgb8 = utils.to8b(rgbs[i])
+            filename = os.path.join(savedir, '{:03d}.png'.format(i))
+            imageio.imwrite(filename, rgb8)
+
+    rgbs = np.array(rgbs)
+    depths = np.array(depths)
+    bgmaps = np.array(bgmaps)
+
+    return rgbs, depths, bgmaps
+
+@torch.no_grad()
+def render_single_viewpoint(model, render_poses, HW, Ks, ndc, render_kwargs,
+                      gt_imgs=None, savedir=None, dump_images=False,
+                      render_factor=0, render_video_flipy=False, render_video_rot90=0,
+                      eval_ssim=False, eval_lpips_alex=False, eval_lpips_vgg=False):
+    assert len(render_poses) == len(HW) and len(HW) == len(Ks)
+
+    if render_factor!=0:
+        HW = np.copy(HW)
+        Ks = np.copy(Ks)
+        HW = (HW/render_factor).astype(int)
+        Ks[:, :2, :3] /= render_factor
+
+    rgbs = []
+    depths = []
+    bgmaps = []
+    psnrs = []
+    ssims = []
+    lpips_alex = []
+    lpips_vgg = []
+
+    i = 0
+    c2w = render_poses[0]
+
+    start = time.time()
+    H, W = HW[i]
+    K = Ks[i]
+    c2w = torch.Tensor(c2w)
+    rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view( #중요
+            H, W, K, c2w, ndc, inverse_y=render_kwargs['inverse_y'],
+            flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
+    keys = ['rgb_marched', 'depth', 'alphainv_last']
+    rays_o = rays_o.flatten(0,-2)
+    rays_d = rays_d.flatten(0,-2)
+    viewdirs = viewdirs.flatten(0,-2)
+    render_result_chunks = [
+        {k: v for k, v in model(ro, rd, vd, **render_kwargs).items() if k in keys}
+        for ro, rd, vd in zip(rays_o.split(8192, 0), rays_d.split(8192, 0), viewdirs.split(8192, 0))
+    ]
+    render_result = {
+        k: torch.cat([ret[k] for ret in render_result_chunks]).reshape(H,W,-1)
+        for k in render_result_chunks[0].keys()
+    }
+    rgb = render_result['rgb_marched'].cpu().numpy()
+    depth = render_result['depth'].cpu().numpy()
+    bgmap = render_result['alphainv_last'].cpu().numpy()
+
+    rgbs.append(rgb)
+    depths.append(depth)
+    bgmaps.append(bgmap)
+    end = time.time()
+    print('Rendering', i, 'time', end-start, 'secs')
+    if i==0:
+        print('Testing', rgb.shape)
+
+    if gt_imgs is not None and render_factor==0:
+        p = -10. * np.log10(np.mean(np.square(rgb - gt_imgs[i])))
+        psnrs.append(p)
+        if eval_ssim:
+            ssims.append(utils.rgb_ssim(rgb, gt_imgs[i], max_val=1))
+        if eval_lpips_alex:
+            lpips_alex.append(utils.rgb_lpips(rgb, gt_imgs[i], net_name='alex', device=c2w.device))
+        if eval_lpips_vgg:
+            lpips_vgg.append(utils.rgb_lpips(rgb, gt_imgs[i], net_name='vgg', device=c2w.device))
 
     if len(psnrs):
         print('Testing psnr', np.mean(psnrs), '(avg)')
@@ -204,7 +313,7 @@ def _compute_bbox_by_cam_frustrm_unbounded(cfg, HW, Ks, poses, i_train, near_cli
     # Find a tightest cube that cover all camera centers
     xyz_min = torch.Tensor([np.inf, np.inf, np.inf])
     xyz_max = -xyz_min
-    for (H, W), K, c2w in zip(HW[i_train], Ks[i_train], poses[i_train]):
+    for (H, W), K, c2w in zip(HW[i_train], Ks[i_train], poses[i_traian]):
         rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
                 H=H, W=W, K=K, c2w=c2w,
                 ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
@@ -212,6 +321,10 @@ def _compute_bbox_by_cam_frustrm_unbounded(cfg, HW, Ks, poses, i_train, near_cli
         pts = rays_o + rays_d * near_clip
         xyz_min = torch.minimum(xyz_min, pts.amin((0,1)))
         xyz_max = torch.maximum(xyz_max, pts.amax((0,1)))
+        # print('H,W,K,c2w', H, W, K, c2w)
+        # print('xyz_min', xyz_min)
+        # print('xyz_max', xyz_max)
+        
     center = (xyz_min + xyz_max) * 0.5
     radius = (center - xyz_min).max() * cfg.data.unbounded_inner_r
     xyz_min = center - radius
@@ -263,6 +376,9 @@ def create_new_model(cfg, cfg_model, cfg_train, xyz_min, xyz_max, stage, coarse_
 
     if cfg.data.ndc:
         print(f'scene_rep_reconstruction ({stage}): \033[96muse multiplane images\033[0m')
+        print('xyz_min', xyz_min)
+        print('xyz_max', xyz_max)
+        print('num_voxels', num_voxels)
         model = dmpigo.DirectMPIGO(
             xyz_min=xyz_min, xyz_max=xyz_max,
             num_voxels=num_voxels,
@@ -330,7 +446,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         if cfg_model.maskout_near_cam_vox:
             model.maskout_near_cam_vox(poses[i_train,:3,3], near)
     else:
-        print(f'scene_rep_reconstruction ({stage}): reload from {reload_ckpt_path}')
+        print(f'\033[91mscene_rep_reconstruction ({stage}): reload from {reload_ckpt_path}\033[0m')
         model, optimizer, start = load_existed_model(args, cfg, cfg_train, reload_ckpt_path)
 
     # init rendering setup
@@ -467,6 +583,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             n_max = render_result['n_max']
             s = render_result['s']
             w = render_result['weights']
+            # n_max = len(w)
             ray_id = render_result['ray_id']
             loss_distortion = flatten_eff_distloss(w, s, 1/n_max, ray_id)
             loss += cfg_train.weight_distortion * loss_distortion
@@ -522,7 +639,126 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         print(f'scene_rep_reconstruction ({stage}): saved checkpoints at', last_ckpt_path)
 
 
-def train(args, cfg, data_dict):
+@app.route("/static/<path:filename>")
+def static_file(filename):
+    response = send_from_directory('static', filename)
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+@app.route("/")
+def home():
+    return render_template('home.html')
+
+def euler_angles_to_rotation_matrix(roll, pitch, yaw):
+    """Compute rotation matrix from Euler angles."""
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(roll), -np.sin(roll)],
+                   [0, np.sin(roll), np.cos(roll)]])
+    
+    Ry = np.array([[np.cos(pitch), 0, np.sin(pitch)],
+                   [0, 1, 0],
+                   [-np.sin(pitch), 0, np.cos(pitch)]])
+    
+    Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
+                   [np.sin(yaw), np.cos(yaw), 0],
+                   [0, 0, 1]])
+    
+    R = Rz @ Ry @ Rx
+    return R
+
+def get_vec3_xyz_torch(x, y, z, roll, pitch, yaw, height, width):
+    # camera to world
+    c2w = np.eye(4)
+    c2w[:3, 3] = [x, y, z]
+    c2w[:3, :3] = euler_angles_to_rotation_matrix(roll, pitch, yaw)
+
+    # world to camera
+    w2c = np.linalg.inv(c2w)
+
+    # camera to ndc
+    K = np.array([[width, 0, width / 2], [0, height, height / 2], [0, 0, 1]])
+    Kinv = np.linalg.inv(K)
+    ndc = np.array([[2 / width, 0, -1], [0, 2 / height, -1], [0, 0, 1]])
+    ndc2cam = np.linalg.inv(K @ ndc)
+
+    # ndc to camera
+    ndc2cam = torch.Tensor(ndc2cam)
+    w2c = torch.Tensor(w2c)
+    vec3_xyz = ndc2cam @ w2c[:3, 3]
+    return vec3_xyz
+
+def generate_image(vec3_xyz, save_path, width, height):
+    data_dict = app.config['data_dict']
+    cfg = app.config['cfg']
+    model = app.config['render_viewpoints_kwargs']['model']
+
+    # render
+    start = time.time()
+    H, W = height, width
+    K = np.array([[W, 0, W / 2], [0, H, H / 2], [0, 0, 1]])
+    c2w = torch.eye(4)
+    c2w[:3, 3] = vec3_xyz
+    rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+        H=H, W=W, K=K, c2w=c2w, ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
+        flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
+    
+    render_kwargs = app.config['render_viewpoints_kwargs']['render_kwargs']
+    rays_o = rays_o.flatten(0,-2)
+    rays_d = rays_d.flatten(0,-2)
+    viewdirs = viewdirs.flatten(0,-2)
+    b_size = 8192
+    
+    #cuda에 데이터 올리기
+    #cuda로 torch로 만든 uvst grid 올리기
+    #이미 올라간 이미지 데이터랑 uvst grid에서 하나씩 뽑아낸 광선에서 가장 유사한 데이터 선택
+    #cuda로 나온 결과를 numpy로 바꾸기
+    
+    render_result_chunks = [
+        {k: v for k, v in model(ro, rd, vd, **render_kwargs).items() if k in ['rgb_marched']}
+        for ro, rd, vd in zip(rays_o.split(b_size, 0), rays_d.split(b_size, 0), viewdirs.split(b_size, 0))
+    ]
+    render_result = {
+        k: torch.cat([ret[k] for ret in render_result_chunks]).reshape(H,W,-1)
+        for k in render_result_chunks[0].keys()
+    }
+    # render_result = model(rays_o, rays_d, viewdirs, **render_kwargs)
+    rgb = render_result['rgb_marched'].detach().cpu().numpy()
+    rgb = rgb.reshape(H, W, 3)
+    end = time.time()
+    print('Rendering time:', end - start, 'secs')
+
+    # save image
+    rgb8 = utils.to8b(rgb)
+    imageio.imwrite(save_path, rgb8)
+
+    return save_path
+
+@socketio.on('request_new_image')
+def handle_request_new_image(data):
+    x = float(data.get('x', 0))
+    y = float(data.get('y', 0))
+    z = float(data.get('z', 0))
+    roll = float(data.get('roll', 0))
+    pitch = float(data.get('pitch', 0))
+    size = 720
+    height, width = size, size
+
+    save_path = 'static/generated_image.png'
+
+    start = time.time()
+    vec3_xyz = get_vec3_xyz_torch(x, y, z, roll, pitch, np.pi, height, width)
+    generate_image(vec3_xyz, save_path, width, height)
+    end = time.time()
+    time_val = end - start
+    time_array.append(time_val)
+    print(f"Inference time: {time_val} sec")
+    print(f"Average inference time: {np.mean(time_array)} sec")
+    socketio.emit('new_image', {'image_file': 'generated_image.png', 'time': time_val, 'avg_time': np.mean(time_array)})
+
+
+def train(args, cfg, data_dict): # 훈련
 
     # init
     print('train: start')
@@ -579,7 +815,7 @@ if __name__=='__main__':
     # load setup
     parser = config_parser()
     args = parser.parse_args()
-    cfg = mmcv.Config.fromfile(args.config)
+    cfg = mmengine.Config.fromfile(args.config)
 
     # init enviroment
     if torch.cuda.is_available():
@@ -630,7 +866,7 @@ if __name__=='__main__':
         train(args, cfg, data_dict)
 
     # load model for rendring
-    if args.render_test or args.render_train or args.render_video:
+    if args.render_test or args.render_train or args.render_video or args.render_free or args.viewer:
         if args.ft_path:
             ckpt_path = args.ft_path
         else:
@@ -658,13 +894,14 @@ if __name__=='__main__':
                 'render_depth': True,
             },
         }
+        app.config['render_viewpoints_kwargs'] = render_viewpoints_kwargs
 
     # render trainset and eval
     if args.render_train:
         testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_train_{ckpt_name}')
         os.makedirs(testsavedir, exist_ok=True)
         print('All results are dumped into', testsavedir)
-        rgbs, depths, bgmaps = render_viewpoints(
+        rgbs, depths, bgmaps = render_viewpoints( #중요
                 render_poses=data_dict['poses'][data_dict['i_train']],
                 HW=data_dict['HW'][data_dict['i_train']],
                 Ks=data_dict['Ks'][data_dict['i_train']],
@@ -712,5 +949,50 @@ if __name__=='__main__':
         depth_vis = plt.get_cmap('rainbow')(1 - np.clip((depths_vis - dmin) / (dmax - dmin), 0, 1)).squeeze()[..., :3]
         imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(depth_vis), fps=30, quality=8)
 
-    print('Done')
+    if args.render_free:
+        testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_video_{ckpt_name}')
+        os.makedirs(testsavedir, exist_ok=True)
+        print('All results are dumped into', testsavedir)
+        rgbs, depths, bgmaps = render_viewpoints(
+                render_poses=data_dict['render_poses'],
+                HW=data_dict['HW'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
+                Ks=data_dict['Ks'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
+                render_factor=args.render_video_factor,
+                render_video_flipy=args.render_video_flipy,
+                render_video_rot90=args.render_video_rot90,
+                savedir=testsavedir, dump_images=args.dump_images,
+                **render_viewpoints_kwargs)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.imwrite(os.path.join(testsavedir, 'video.rgb.png'), utils.to8b(rgbs[0]))
+        imageio.imwrite(os.path.join(testsavedir, 'video.rgb1.png'), utils.to8b(rgbs[1]))
+        import matplotlib.pyplot as plt
+        depths_vis = depths * (1-bgmaps) + bgmaps
+        dmin, dmax = np.percentile(depths_vis[bgmaps < 0.1], q=[5, 95])
+        depth_vis = plt.get_cmap('rainbow')(1 - np.clip((depths_vis - dmin) / (dmax - dmin), 0, 1)).squeeze()[..., :3]
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(depth_vis), fps=30, quality=8)
+        imageio.imwrite(os.path.join(testsavedir, 'video.depth.png'), utils.to8b(depth_vis[0]))
+        # save depth to npy
+        print('depths[0][..., 0].shape', depths[0][..., 0].shape)
+        np.save(os.path.join(testsavedir, 'video.depth0.npy'), depths[0][..., 0])
+        np.save(os.path.join(testsavedir, 'video.depth1.npy'), depths[1][..., 0])
+        depth_min = depths[0][..., 0].min()
+        depth_max = depths[0][..., 0].max()
+        layer_count = 32
+        depth_range = np.linspace(depth_min, depth_max, layer_count + 1)
+        rgbs_8bit = utils.to8b(rgbs[0])
+        
+        for i in range(layer_count):
+            mask = (depths[0][..., 0] >= depth_range[i]) & (depths[0][..., 0] < depth_range[i + 1])
+            layer_image = np.zeros_like(rgbs_8bit)
+            layer_image[mask] = rgbs_8bit[mask]
+            imageio.imwrite(os.path.join(testsavedir, f'layer_{i:02d}.png'), layer_image)
 
+        print('32 layer images saved.')
+    
+    if args.viewer:
+        app.config['data_dict'] = data_dict
+        app.config['args'] = args
+        app.config['cfg'] = cfg
+        socketio.run(app, host='0.0.0.0', port=6006, debug=True)
+
+    print('Done')
